@@ -1,0 +1,8 @@
+{
+  "name": "cam_enforcer_bot",
+  "status": "active",
+  "created": "2026-10-15T04:20:14.470Z",
+  "lastModified": "2026-10-15T04:54:26.371Z",
+  "description": "Discord bot that kicks users from voice chat if they don't have their camera on. Part of the deadplug crew — no tracking, no metrics, just enforcement.",
+  "assignedChoom": "Spike"
+}

@@ -1,0 +1,20 @@
+# Secrets — NEVER commit these
+.env
+*.env
+
+# Runtime state
+settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
