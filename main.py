@@ -92,10 +92,7 @@ class CamEnforcer(commands.Bot):
         """Return True if the member should never be kicked."""
         if member.bot:
             return True
-        exempt_ids = set(config.EXEMPT_ROLE_IDS)
-        # merge per-guild exempt roles
-        guild_exempt = get_guild_setting(member.guild.id, "exempt_role_ids", [])
-        exempt_ids.update(guild_exempt)
+        exempt_ids = set(get_guild_setting(member.guild.id, "exempt_role_ids", config.EXEMPT_ROLE_IDS))
         for role in member.roles:
             if role.id in exempt_ids:
                 return True
@@ -103,9 +100,17 @@ class CamEnforcer(commands.Bot):
 
     def _is_watched(self, channel: discord.VoiceChannel) -> bool:
         """Return True if this voice channel is under enforcement."""
-        watched = set(config.WATCHED_CHANNEL_IDS)
-        watched.update(get_guild_setting(channel.guild.id, "watched_channel_ids", []))
+        watched = get_guild_setting(channel.guild.id, "watched_channel_ids", config.WATCHED_CHANNEL_IDS)
         return channel.id in watched
+
+    def _should_enforce(self, member: discord.Member) -> bool:
+        voice = member.voice
+        return bool(
+            voice and voice.channel
+            and not voice.self_video
+            and self._is_watched(voice.channel)
+            and not self._is_exempt(member)
+        )
 
     def _grace_seconds(self, guild_id: int) -> int:
         return get_guild_setting(guild_id, "grace_seconds", config.GRACE_SECONDS)
@@ -132,12 +137,12 @@ class CamEnforcer(commands.Bot):
                 f"You have **{seconds_left}s** left to enable your camera in **{member.voice.channel.name}** "
                 f"or you will be disconnected."
             )
-        except discord.Forbidden:
-            pass  # DMs closed
+        except discord.HTTPException:
+            pass  # Warning delivery must not prevent enforcement.
 
     async def _kick_for_no_cam(self, member: discord.Member) -> None:
         """Disconnect a member for failing to enable their camera."""
-        if not member.voice or not member.voice.channel:
+        if not self._should_enforce(member):
             return
         channel = member.voice.channel
         try:
@@ -178,24 +183,37 @@ class CamEnforcer(commands.Bot):
                 if warn > 0 and grace > warn:
                     await asyncio.sleep(grace - warn)
                     # re-check before warning
-                    if member.voice and member.voice.self_video:
+                    current_member = member.guild.get_member(member_id)
+                    if current_member is None or not self._should_enforce(current_member):
                         return
-                    await self._dm_warn(member, warn)
+                    await self._dm_warn(current_member, warn)
                     await asyncio.sleep(warn)
                 else:
                     await asyncio.sleep(grace)
 
                 # final check
-                if member.voice and member.voice.self_video:
+                current_member = member.guild.get_member(member_id)
+                if current_member is None:
                     return
-                await self._kick_for_no_cam(member)
+                await self._kick_for_no_cam(current_member)
             except asyncio.CancelledError:
                 pass
             finally:
-                self._pending_kicks.get(guild_id, {}).pop(member_id, None)
+                pending = self._pending_kicks.get(guild_id, {})
+                if pending.get(member_id) is asyncio.current_task():
+                    pending.pop(member_id)
 
         task = asyncio.create_task(_countdown())
         self._pending_kicks.setdefault(guild_id, {})[member_id] = task
+
+    async def _scan_guild_voice_members(self, guild: discord.Guild) -> None:
+        """Reconcile countdowns with members currently connected to voice."""
+        for channel in guild.voice_channels:
+            for member in channel.members:
+                if not self._should_enforce(member):
+                    self._cancel_pending(guild.id, member.id)
+                elif member.id not in self._pending_kicks.get(guild.id, {}):
+                    await self._schedule_kick(member)
 
     # ------------------------------------------------------------------
     # Events
@@ -205,6 +223,8 @@ class CamEnforcer(commands.Bot):
         print(f"Bot logged in as {self.user} ({self.user.id})")
         print(f"Watching {len(config.WATCHED_CHANNEL_IDS)} channel(s) from env.")
         print("------")
+        for guild in self.guilds:
+            await self._scan_guild_voice_members(guild)
 
     async def on_voice_state_update(
         self,
@@ -216,34 +236,12 @@ class CamEnforcer(commands.Bot):
         if member.id == self.user.id:
             return
 
-        # --- user joined a watched channel ---
-        if after.channel and after.channel != before.channel:
-            if self._is_watched(after.channel):
-                if self._is_exempt(member):
-                    return
-                if after.self_video:
-                    return  # already on cam
-                await self._schedule_kick(member)
+        if not self._should_enforce(member):
+            self._cancel_pending(member.guild.id, member.id)
             return
 
-        # --- user turned camera on while in a watched channel ---
-        if after.channel and after.channel == before.channel:
-            if not self._is_watched(after.channel):
-                return
-            if after.self_video and not before.self_video:
-                # camera turned ON — cancel any pending kick
-                self._cancel_pending(member.guild.id, member.id)
-                return
-            if not after.self_video and before.self_video:
-                # camera turned OFF — start grace again
-                if self._is_exempt(member):
-                    return
-                await self._schedule_kick(member)
-                return
-
-        # --- user left the voice channel ---
-        if before.channel and not after.channel:
-            self._cancel_pending(member.guild.id, member.id)
+        if after.channel != before.channel or before.self_video:
+            await self._schedule_kick(member)
 
 
 # ---------------------------------------------------------------------------
@@ -276,9 +274,11 @@ async def camset_warning(interaction: discord.Interaction, seconds: app_commands
 @app_commands.describe(channel="Voice channel to enforce camera in.")
 @app_commands.checks.has_permissions(administrator=True)
 async def camset_watch(interaction: discord.Interaction, channel: discord.VoiceChannel):
-    watched = set(get_guild_setting(interaction.guild_id, "watched_channel_ids", []))
+    watched = set(get_guild_setting(interaction.guild_id, "watched_channel_ids", config.WATCHED_CHANNEL_IDS))
     watched.add(channel.id)
     set_guild_setting(interaction.guild_id, "watched_channel_ids", list(watched))
+    if interaction.guild is not None:
+        await bot._scan_guild_voice_members(interaction.guild)
     await interaction.response.send_message(f"✅ Now watching <#{channel.id}>.", ephemeral=True)
 
 
@@ -286,9 +286,11 @@ async def camset_watch(interaction: discord.Interaction, channel: discord.VoiceC
 @app_commands.describe(channel="Voice channel to stop enforcing.")
 @app_commands.checks.has_permissions(administrator=True)
 async def camset_unwatch(interaction: discord.Interaction, channel: discord.VoiceChannel):
-    watched = set(get_guild_setting(interaction.guild_id, "watched_channel_ids", []))
+    watched = set(get_guild_setting(interaction.guild_id, "watched_channel_ids", config.WATCHED_CHANNEL_IDS))
     watched.discard(channel.id)
     set_guild_setting(interaction.guild_id, "watched_channel_ids", list(watched))
+    if interaction.guild is not None:
+        await bot._scan_guild_voice_members(interaction.guild)
     await interaction.response.send_message(f"✅ Stopped watching <#{channel.id}>.", ephemeral=True)
 
 
@@ -296,9 +298,11 @@ async def camset_unwatch(interaction: discord.Interaction, channel: discord.Voic
 @app_commands.describe(role="Role whose members will never be kicked.")
 @app_commands.checks.has_permissions(administrator=True)
 async def camset_exempt(interaction: discord.Interaction, role: discord.Role):
-    exempt = set(get_guild_setting(interaction.guild_id, "exempt_role_ids", []))
+    exempt = set(get_guild_setting(interaction.guild_id, "exempt_role_ids", config.EXEMPT_ROLE_IDS))
     exempt.add(role.id)
     set_guild_setting(interaction.guild_id, "exempt_role_ids", list(exempt))
+    if interaction.guild is not None:
+        await bot._scan_guild_voice_members(interaction.guild)
     await interaction.response.send_message(f"✅ Exempted role {role.mention}.", ephemeral=True)
 
 
@@ -306,9 +310,11 @@ async def camset_exempt(interaction: discord.Interaction, role: discord.Role):
 @app_commands.describe(role="Role to remove exemption from.")
 @app_commands.checks.has_permissions(administrator=True)
 async def camset_unexempt(interaction: discord.Interaction, role: discord.Role):
-    exempt = set(get_guild_setting(interaction.guild_id, "exempt_role_ids", []))
+    exempt = set(get_guild_setting(interaction.guild_id, "exempt_role_ids", config.EXEMPT_ROLE_IDS))
     exempt.discard(role.id)
     set_guild_setting(interaction.guild_id, "exempt_role_ids", list(exempt))
+    if interaction.guild is not None:
+        await bot._scan_guild_voice_members(interaction.guild)
     await interaction.response.send_message(f"✅ Removed exemption for role {role.mention}.", ephemeral=True)
 
 
@@ -326,8 +332,8 @@ async def camset_show(interaction: discord.Interaction):
     gid = interaction.guild_id
     grace = get_guild_setting(gid, "grace_seconds", config.GRACE_SECONDS)
     warn = get_guild_setting(gid, "warning_seconds", config.WARNING_SECONDS)
-    watched = get_guild_setting(gid, "watched_channel_ids", [])
-    exempt = get_guild_setting(gid, "exempt_role_ids", [])
+    watched = get_guild_setting(gid, "watched_channel_ids", config.WATCHED_CHANNEL_IDS)
+    exempt = get_guild_setting(gid, "exempt_role_ids", config.EXEMPT_ROLE_IDS)
     log_id = get_guild_setting(gid, "log_channel_id", config.LOG_CHANNEL_ID)
 
     lines = [

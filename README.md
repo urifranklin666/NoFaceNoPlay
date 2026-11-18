@@ -75,6 +75,11 @@ LOG_CHANNEL_ID=0
 Leave any var **empty** and it simply won't be applied at startup — you can
 configure it live instead.
 
+Environment channel and exempt-role lists are defaults. Once changed through
+slash commands, the saved list for that server takes precedence, including an
+empty list. This lets `/camset unwatch` and `/camset unexempt` remove entries
+originally supplied through the environment.
+
 ### Via slash commands (live, per-server)
 
 | Command | Description |
@@ -108,6 +113,19 @@ token in `.env` or the environment and run again.
 5. At the end of the grace period, they're disconnected.
 
 Bots and members with an exempt role are never touched.
+
+Members already in watched channels are checked when the bot becomes ready.
+Moving to an unwatched channel cancels the countdown, and current channel,
+camera, and exemption settings are checked again before disconnecting anyone.
+Warning DM delivery failures do not stop enforcement.
+
+## Tests
+
+Run the offline regression suite without a bot token or Discord connection:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Files
 
